@@ -72,6 +72,11 @@ services:
         condition: service_started
     networks:
       - analyzer_network
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
 
   celery_worker:
     build: ./backend
@@ -79,6 +84,7 @@ services:
     volumes:
       - ./backend:/app
       - backend_media:/app/media
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - DATABASE_URL=postgres://postgres:1243268h@postgres:5432/testgen
       - REDIS_URL=redis://redis:6379/0
