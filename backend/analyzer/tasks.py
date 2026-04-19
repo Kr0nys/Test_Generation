@@ -107,9 +107,10 @@ def analyze_project(self, session_id: str):
 
 @shared_task(bind=True, max_retries=2)
 def generate_tests_task(self, task_id: str):
-    """
-    Задача генерации юнит-тестов с помощью локальной AI модели (Ollama).
-    """
+    """Задача генерации юнит-тестов с помощью AI"""
+    from .models import TestGenerationTask, AnalysisSession
+    from .utils.ai_generator import AITestGenerator
+
     try:
         task = TestGenerationTask.objects.get(id=task_id)
         logger.info(f"🧪 Starting test generation for task {task_id}")
@@ -118,9 +119,15 @@ def generate_tests_task(self, task_id: str):
         task.save(update_fields=['status', 'updated_at'])
 
         session = task.session
-        generator = AITestGenerator()
+        generator = AITestGenerator(model=task.config.get('model', 'llama3.2'))
 
-        # Собираем код из всех файлов сессии
+        # Проверяем доступность Ollama
+        if not generator.check_ollama_available():
+            logger.warning("⚠️ Ollama not available, using basic tests")
+            task.config['fallback'] = True
+            task.config['detail_level'] = 'basic'
+
+        # Собираем код из файлов
         code_content = ""
         for uploaded_file in session.files.all():
             try:
@@ -133,12 +140,10 @@ def generate_tests_task(self, task_id: str):
         if not code_content.strip():
             raise ValueError("No code content available for test generation")
 
-        # Ограничиваем длину кода для AI (чтобы не превысить контекст модели)
-        code_content = code_content[:15000]
-
+        # Генерация тестов
         logger.info(f"🤖 Generating tests with config: {task.config}")
         tests = generator.generate_tests(
-            code=code_content,
+            code=code_content[:15000],  # Ограничиваем для AI
             metrics=session.metrics,
             config=task.config
         )
@@ -147,11 +152,11 @@ def generate_tests_task(self, task_id: str):
         task.status = 'COMPLETED'
         task.save(update_fields=['generated_tests', 'status', 'updated_at'])
 
-        # Обновляем статус сессии
+        # Обновляем сессию
         session.status = 'TESTS_GENERATED'
         session.save(update_fields=['status', 'updated_at'])
 
-        logger.info(f"✅ Test generation completed: {len(tests)} characters generated")
+        logger.info(f"✅ Test generation completed: {len(tests)} characters")
 
         return {
             'status': 'success',
@@ -171,11 +176,10 @@ def generate_tests_task(self, task_id: str):
             task.status = 'FAILED'
             task.error_message = str(exc)
             task.save(update_fields=['status', 'error_message', 'updated_at'])
-        except Exception as e:
-            logger.error(f"Could not update task status: {e}")
+        except:
+            pass
 
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
-
 
 @shared_task
 def cleanup_expired_sessions():
