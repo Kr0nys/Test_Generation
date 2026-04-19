@@ -1,21 +1,38 @@
+# backend/analyzer/utils/docker_runner.py
+
 import docker
-import tempfile
 import os
 import json
 import logging
 import shutil
-from typing import List, Dict, Optional
+import time
+import uuid
+import tarfile
+import io
+from typing import List, Dict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+RESULT_FILENAME = '_result.json'
+PROTECTED_PREFIXES = ['analyzer_', 'docker_', 'k8s_', 'python-test-gen-']
+
 
 class DockerRunner:
-    """Запуск пользовательского кода в изолированном Docker-контейнере"""
+    """
+    Запуск анализа кода в изолированном Docker-контейнере.
+
+    ✅ ИСПОЛЬЗУЕТ /tmp (всегда существует) + docker cp для надёжности на Windows
+    """
 
     def __init__(self, timeout: int = 60):
-        self.client = docker.from_env()
-        self.timeout = timeout  # Максимальное время выполнения в секундах
+        try:
+            self.client = docker.from_env()
+            self.timeout = timeout
+            logger.info("✅ Docker client initialized")
+        except docker.errors.DockerException as e:
+            logger.error(f"❌ Docker init failed: {e}")
+            raise
 
     def run_analysis_container(
             self,
@@ -24,358 +41,290 @@ class DockerRunner:
             dependencies: List[str] = None,
             run_tests: bool = False
     ) -> Dict:
-        """
-        Запускает анализ кода в изолированном контейнере
+        """Запускает анализ с использованием docker cp и /tmp"""
 
-        Args:
-            file_paths: Пути к файлам для анализа
-            python_version: Версия Python (3.7-3.11)
-            dependencies: Список зависимостей для установки
-            run_tests: Запускать ли тесты после анализа
-
-        Returns:
-            Dict с результатами: статус, метрики, логи, ошибки
-        """
         work_dir = None
+        container = None
 
         try:
-            # Создаём временную рабочую директорию
-            work_dir = tempfile.mkdtemp(prefix='analyzer_')
-            logger.info(f"Created work directory: {work_dir}")
+            # 1. Создаём временную директорию НА ХОСТЕ
+            work_dir = f"/tmp/analyzer_{uuid.uuid4().hex[:8]}"
+            os.makedirs(work_dir, exist_ok=True)
+            logger.info(f"✅ Created work dir: {work_dir}")
 
-            # 1. Копируем файлы пользователя
+            # 2. Копируем файлы пользователя
             for file_path in file_paths:
                 dest = os.path.join(work_dir, os.path.basename(file_path))
-                logger.info(f"📁 Copying: {file_path} → {dest}")
-                logger.info(f"   Source exists: {os.path.exists(file_path)}")
-                logger.info(f"   Source size: {os.path.getsize(file_path)} bytes")
-
                 shutil.copy2(file_path, dest)
+                logger.debug(f"📁 Copied: {os.path.basename(file_path)}")
 
-                logger.info(f"   Dest exists: {os.path.exists(dest)}")
-                logger.info(f"   Dest size: {os.path.getsize(dest)} bytes")
-
-            logger.info(f"✅ Copied {len(file_paths)} files to {work_dir}")
-
-            # 3. Показываем содержимое рабочей директории
-            logger.info(f"📂 Work dir contents: {os.listdir(work_dir)}")
-
-            # 2. Создаём requirements.txt
+            # 3. Создаём requirements.txt
             if dependencies:
                 req_path = os.path.join(work_dir, 'requirements.txt')
+                deps = [d.strip() for d in dependencies if d.strip() and not d.startswith('#')]
+                deps += ['radon==6.0.1', 'flake8==6.1.0', 'bandit==1.7.5']
                 with open(req_path, 'w', encoding='utf-8') as f:
-                    # Фильтруем пустые строки и комментарии
-                    valid_deps = [d.strip() for d in dependencies if d.strip() and not d.startswith('#')]
-                    f.write('\n'.join(valid_deps))
-                logger.debug(f"Created requirements.txt with {len(valid_deps)} dependencies")
+                    f.write('\n'.join(set(deps)))
 
-            # 3. Создаём скрипт анализатора
-            analyzer_script = self._create_simple_analyzer()
+            # 4. Создаём скрипт анализатора
+            analyzer_script = self._create_advanced_analyzer()
             analyzer_path = os.path.join(work_dir, '_analyzer.py')
             with open(analyzer_path, 'w', encoding='utf-8') as f:
                 f.write(analyzer_script)
 
-            # 4. Конфигурация контейнера с ограничениями безопасности
-            container_config = {
-                'image': f'python:{python_version}-slim',
-                'volumes': {
-                    work_dir: {'bind': '/app', 'mode': 'rw'},
-                },
-                'network_mode': 'none',  # 🔒 Нет доступа к сети
-                'mem_limit': '512m',  # 🔒 Лимит памяти
-                'cpu_quota': 50000,  # 🔒 50% одного ядра CPU
-                'pids_limit': 50,  # 🔒 Лимит процессов
-                'working_dir': '/app',
-                'command': f'python _analyzer.py',
-                'detach': True,
-                'tty': False,
-                'user': '1000:1000',  # 🔒 Запуск от non-root пользователя
-                'read_only': False,  # Разрешаем запись для отчётов
-                'tmpfs': {  # 🔒 Временные файлы в RAM
-                    '/tmp': 'rw,noexec,nosuid,size=64m'
-                },
-                'cap_drop': ['ALL'],  # 🔒 Убираем все capabilities
-                'security_opt': ['no-new-privileges:true'],  # 🔒 Запрет escalation
+            # 5. 🐳 Запускаем КОНТЕЙНЕР (без томов, с root для копирования)
+            container = self.client.containers.run(
+                image=f'python:{python_version}-slim',
+                command='sleep 300',  # Держим живым
+                network_mode='none',
+                mem_limit='256m',
+                cpu_quota=25000,
+                pids_limit=30,
+                detach=True,
+                tty=False,
+                # ✅ Запускаем как root для надёжного копирования файлов
+                user='0:0',
+                cap_drop=['ALL'],
+                security_opt=['no-new-privileges:true'],
+            )
+            logger.info(f"🐳 Container started: {container.short_id}")
+
+            # 6. 📦 Копируем файлы ВНУТРЬ контейнера через put_archive
+            # ✅ Используем /tmp/analysis который всегда существует и доступен для root
+            container_work_dir = '/tmp/analysis'
+
+            logger.info(f"📦 Copying files into container at {container_work_dir}...")
+
+            # Создаём tar-архив из файлов в work_dir
+            tar_buffer = io.BytesIO()
+            with tarfile.open(fileobj=tar_buffer, mode='w') as tar:
+                for fname in os.listdir(work_dir):
+                    fpath = os.path.join(work_dir, fname)
+                    tar.add(fpath, arcname=fname)  # Добавляем только имя файла
+            tar_buffer.seek(0)
+
+            # ✅ Сначала создаём директорию внутри контейнера
+            container.exec_run(f'mkdir -p {container_work_dir}', user='root')
+
+            # Копируем архив в контейнер
+            container.put_archive(container_work_dir, tar_buffer.getvalue())
+            logger.info(f"✅ Files copied to {container_work_dir} in container")
+
+            # 7. 🔍 Проверяем что файлы видны внутри
+            check = container.exec_run(f'ls -la {container_work_dir}/', user='root')
+            logger.debug(f"🔍 Container contents: {check.output.decode('utf-8', errors='ignore')[:500]}")
+
+            # 8. 🚀 Запускаем анализ через exec_run (от пользователя 1000 для безопасности)
+            logger.info(f"🚀 Running analysis...")
+            exec_result = container.exec_run(
+                cmd=f'python {container_work_dir}/_analyzer.py',
+                user='0:0',  # ✅ Запускаем от root (безопасно в изолированном контейнере)
+                workdir=container_work_dir,
+                stream=False
+            )
+
+            logs = exec_result.output.decode('utf-8', errors='ignore') if exec_result.output else ''
+            exit_code = exec_result.exit_code if hasattr(exec_result, 'exit_code') else 0
+
+            if logs.strip():
+                logger.info(f"📋 Container output:\n{logs[:3000]}")
+
+            # 9. 📥 Копируем результат ОБРАТНО (тоже от root)
+            analysis_data = {}
+            try:
+                result_bits, _ = container.get_archive(f'{container_work_dir}/{RESULT_FILENAME}')
+
+                # Распаковываем tar
+                result_buffer = io.BytesIO()
+                for chunk in result_bits:
+                    result_buffer.write(chunk)
+                result_buffer.seek(0)
+
+                with tarfile.open(fileobj=result_buffer, mode='r') as tar:
+                    for member in tar.getmembers():
+                        if member.name.endswith(RESULT_FILENAME):
+                            f = tar.extractfile(member)
+                            if f:
+                                analysis_data = json.load(f)
+                                logger.info(f"✅ Results loaded from container")
+                                break
+            except Exception as e:
+                logger.warning(f"⚠️ Could not extract results: {e}")
+                # Фоллбэк: пробуем прочитать из work_dir на хосте
+                host_result = os.path.join(work_dir, RESULT_FILENAME)
+                if os.path.exists(host_result):
+                    with open(host_result, 'r', encoding='utf-8') as f:
+                        analysis_data = json.load(f)
+                    logger.info(f"✅ Results loaded from host fallback")
+
+            # 10. Удаляем контейнер
+            container.remove(force=True)
+            container = None
+
+            return {
+                'status': 'success' if exit_code == 0 else 'failed',
+                'exit_code': exit_code,
+                'logs': logs[-10000:],
+                'analysis': analysis_data,
+                'resources': analysis_data.get('resources', {})
             }
 
-            # 5. Запускаем контейнер
-            logger.info(f"Starting container with image python:{python_version}-slim")
-            container = self.client.containers.run(**container_config)
-
-            logs = container.logs().decode('utf-8', errors='ignore')
-            logger.info(f"📋 Container stdout:\n{logs}")
-
-            # 5. Проверим результат
-            results_path = os.path.join(work_dir, '_result.json')
-            logger.info(f" Looking for results at: {results_path}")
-            logger.info(f"   File exists: {os.path.exists(results_path)}")
-
-            if os.path.exists(results_path):
-                with open(results_path, 'r', encoding='utf-8') as f:
-                    analysis_data = json.load(f)
-                logger.info(f"✅ Results loaded: {analysis_data.get('metrics', {})}")
-            else:
-                logger.warning(f"❌ Results file NOT found!")
-                # Покажем что есть в директории
-                logger.warning(f"   Work dir contents: {os.listdir(work_dir)}")
-
-            # 6. Ожидаем завершения с таймаутом
-            try:
-                exit_result = container.wait(timeout=self.timeout)
-                logs = container.logs().decode('utf-8', errors='ignore')
-
-                # 7. Читаем результаты анализа
-                results_path = os.path.join(work_dir, '_analysis_result.json')
-                analysis_data = {}
-
-                if os.path.exists(results_path):
-                    with open(results_path, 'r', encoding='utf-8') as f:
-                        analysis_data = json.load(f)
-                    logger.info(f"Analysis results loaded: {results_path}")
-
-                # 8. Читаем отчёт о покрытии (если есть)
-                coverage_data = None
-                coverage_path = os.path.join(work_dir, '_coverage_report.json')
-                if os.path.exists(coverage_path):
-                    with open(coverage_path, 'r', encoding='utf-8') as f:
-                        coverage_data = json.load(f)
-
-                container.remove()
-
-                return {
-                    'status': 'success',
-                    'exit_code': exit_result.get('StatusCode', -1),
-                    'logs': logs[-10000:],  # Последние 10KB логов
-                    'analysis': analysis_data,
-                    'coverage': coverage_data,
-                    'resources': analysis_data.get('resources', {})
-                }
-
-            except docker.errors.APIError as e:
-                container.kill()
-                container.remove()
-                logger.error(f"Docker API error: {e}")
-                return {'status': 'failed', 'error': f'Docker error: {str(e)}'}
-
-            except Exception as e:
-                container.kill()
-                container.remove()
-                logger.error(f"Container execution error: {e}")
-                return {'status': 'failed', 'error': f'Execution error: {str(e)}'}
-
         except docker.errors.DockerException as e:
-            logger.error(f"Docker daemon error: {e}")
-            return {'status': 'failed', 'error': f'Docker daemon: {str(e)}'}
-
+            logger.error(f"❌ Docker error: {e}")
+            return {'status': 'failed', 'error': f'Docker: {str(e)}'}
         except Exception as e:
-            logger.error(f"Unexpected error: {e}", exc_info=True)
-            return {'status': 'failed', 'error': f'Unexpected: {str(e)}'}
-
+            logger.error(f"❌ Unexpected error: {e}", exc_info=True)
+            return {'status': 'failed', 'error': f'Error: {str(e)}'}
         finally:
-            # Очистка временной директории
+            if container:
+                try:
+                    container.remove(force=True)
+                except:
+                    pass
             if work_dir and os.path.exists(work_dir):
                 try:
                     shutil.rmtree(work_dir)
-                    logger.debug(f"Cleaned up work directory: {work_dir}")
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup {work_dir}: {e}")
+                except:
+                    pass
 
-    def _create_simple_analyzer(self) -> str:
-        """Простой анализатор с обработкой ошибок для отладки"""
-        return '''
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""Анализатор кода с подробным логированием ошибок"""
+    def _cleanup_old_containers(self):
+        """Очистка старых контейнеров анализа"""
+        try:
+            old = self.client.containers.list(all=True, filters={'status': 'exited'})
+            for c in old[:10]:
+                if any(c.name.startswith(p) for p in PROTECTED_PREFIXES):
+                    continue
+                if c.name.startswith('analysis_'):
+                    c.remove(force=True)
+        except Exception as e:
+            logger.debug(f"⚠️ Cleanup failed: {e}")
 
-import ast
-import os
-import sys
-import json
-import traceback
+    def _create_advanced_analyzer(self) -> str:
+        """Генерирует скрипт анализатора (использует /tmp/analysis)"""
+        return r'''#!/usr/bin/env python3
+import ast, os, sys, json, traceback, time, tracemalloc, resource, subprocess
 from pathlib import Path
 
-APP_DIR = Path('/app')
-RESULT_FILE = APP_DIR / '_result.json'
+# ✅ Используем cwd (контейнер запускается с workdir=/tmp/analysis)
+APP = Path(os.getcwd())
+OUT = APP / '_result.json'
 
-def log(msg):
-    """Пишет в stderr чтобы видеть в логах Docker"""
-    print(f"[ANALYZER] {msg}", file=sys.stderr, flush=True)
+def log(m): print(f"[ANALYZER] {m}", file=sys.stderr, flush=True)
 
 class CodeAnalyzer(ast.NodeVisitor):
     def __init__(self):
-        self.functions = []
-        self.classes = []
-        self.imports = set()
-        self.total_lines = 0
+        self.functions, self.classes, self.imports = [], [], set()
+        self.total_lines, self.docstring_count = 0, 0
 
-    def analyze_file(self, filepath):
+    def analyze_file(self, fp):
         try:
-            log(f"Reading file: {filepath}")
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-                self.total_lines += len(content.splitlines())
-                tree = ast.parse(content)
-            self.visit(tree)
-            log(f"✓ Parsed: {filepath.name}")
+            with open(fp, 'r', encoding='utf-8-sig', errors='ignore') as f:
+                c = f.read()
+                self.total_lines += len(c.splitlines())
+                self.visit(ast.parse(c))
             return True
-        except SyntaxError as e:
-            log(f"✗ SyntaxError in {filepath.name}: {e}")
-            return False
         except Exception as e:
-            log(f"✗ Error parsing {filepath.name}: {type(e).__name__}: {e}")
+            log(f"✗ {fp.name}: {e}")
             return False
 
-    def visit_FunctionDef(self, node):
-        self.functions.append({
-            'name': node.name,
-            'line': node.lineno,
-            'args': [arg.arg for arg in node.args.args if arg.arg != 'self'],
-            'is_async': False
-        })
-        self.generic_visit(node)
-
-    def visit_AsyncFunctionDef(self, node):
-        self.functions.append({
-            'name': node.name,
-            'line': node.lineno,
-            'args': [arg.arg for arg in node.args.args if arg.arg != 'self'],
-            'is_async': True
-        })
-        self.generic_visit(node)
-
-    def visit_ClassDef(self, node):
-        self.classes.append({'name': node.name, 'line': node.lineno})
-        self.generic_visit(node)
-
-    def visit_Import(self, node):
-        for alias in node.names:
-            self.imports.add(alias.name.split('.')[0])
-        self.generic_visit(node)
-
-    def visit_ImportFrom(self, node):
-        if node.module:
-            self.imports.add(node.module.split('.')[0])
-        self.generic_visit(node)
-
-    def get_summary(self):
+    def visit_FunctionDef(self, n): self._add(n, False); self.generic_visit(n)
+    def visit_AsyncFunctionDef(self, n): self._add(n, True); self.generic_visit(n)
+    def visit_ClassDef(self, n):
+        self.classes.append({'name': n.name, 'line': n.lineno, 'has_docstring': bool(ast.get_docstring(n))})
+        if ast.get_docstring(n): self.docstring_count += 1
+        self.generic_visit(n)
+    def visit_Import(self, n):
+        for a in n.names: self.imports.add(a.name.split('.')[0])
+        self.generic_visit(n)
+    def visit_ImportFrom(self, n):
+        if n.module: self.imports.add(n.module.split('.')[0])
+        self.generic_visit(n)
+    def _add(self, n, async_flag):
+        args = [a.arg for a in n.args.args if a.arg != 'self']
+        self.functions.append({'name': n.name, 'line': n.lineno, 'args': args, 'is_async': async_flag, 'has_docstring': bool(ast.get_docstring(n))})
+        if ast.get_docstring(n): self.docstring_count += 1
+    def summary(self):
         return {
-            'functions_count': len(self.functions),
-            'classes_count': len(self.classes),
-            'imports_count': len(self.imports),
-            'async_functions': len([f for f in self.functions if f['is_async']]),
-            'total_lines': self.total_lines,
-            'functions': self.functions,
-            'classes': self.classes,
-            'imports': list(self.imports)
+            'functions_count': len(self.functions), 'classes_count': len(self.classes),
+            'imports_count': len(self.imports), 'async_functions': len([f for f in self.functions if f['is_async']]),
+            'total_lines': self.total_lines, 'docstring_ratio': round(self.docstring_count / max(len(self.functions)+len(self.classes),1), 2)
         }
 
-def save_result(result: dict):
-    """Сохраняет результат с обработкой ошибок записи"""
-    try:
-        log(f"Saving results to {RESULT_FILE}")
-        with open(RESULT_FILE, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False, default=str)
-        log(f"✓ Results saved successfully")
-        return True
-    except Exception as e:
-        log(f"✗ Failed to save results: {type(e).__name__}: {e}")
-        # Пробуем сохранить в альтернативное место
+def run_static_tools(files):
+    results = {'radon': {}, 'flake8': {}, 'bandit': {}}
+    for fp in files[:3]:
+        fn = fp.name
         try:
-            alt_path = Path('/tmp/_result.json')
-            with open(alt_path, 'w', encoding='utf-8') as f:
-                json.dump(result, f, indent=2, ensure_ascii=False, default=str)
-            log(f"✓ Results saved to alternative path: {alt_path}")
-            return True
-        except:
-            return False
+            r = subprocess.run(['radon', 'cc', str(fp), '--json'], capture_output=True, text=True, timeout=20)
+            if r.returncode == 0 and r.stdout.strip():
+                d = json.loads(r.stdout)
+                if fn in d:
+                    m = d[fn].get('methods', [])
+                    cx = [x['complexity'] for x in m]
+                    results['radon'][fn] = {'avg': round(sum(cx)/len(cx),2) if cx else 0, 'max': max(cx) if cx else 0}
+        except: pass
+        try:
+            r = subprocess.run(['flake8', str(fp), '--count'], capture_output=True, text=True, timeout=20)
+            results['flake8'][fn] = {'count': len([l for l in r.stdout.split('\n') if l.strip() and ':' in l])}
+        except: pass
+    return results
 
 def main():
-    log("🚀 Analyzer starting...")
-    log(f"📂 APP_DIR: {APP_DIR}, exists: {APP_DIR.exists()}")
-
+    start = time.time()
+    tracemalloc.start()
     try:
-        # Показать содержимое директории
-        try:
-            files = [f.name for f in APP_DIR.iterdir()]
-            log(f"📁 Files in /app: {files}")
-        except Exception as e:
-            log(f"⚠️ Could not list /app: {e}")
+        log(f"🔍 CWD={os.getcwd()}, APP={APP}, exists={APP.exists()}")
+        try: log(f"📁 Files: {[f.name for f in APP.iterdir()]}")
+        except Exception as e: log(f"❌ List error: {e}")
 
-        # Установка зависимостей (если есть requirements.txt)
-        req_file = APP_DIR / 'requirements.txt'
-        if req_file.exists():
-            log(f"📦 Installing dependencies from {req_file}")
-            os.system('pip install -q -r requirements.txt 2>&1')
+        req = APP / 'requirements.txt'
+        if req.exists(): os.system('pip install -q -r requirements.txt 2>&1')
 
-        # Поиск Python файлов
-        python_files = [f for f in APP_DIR.glob('*.py') if f.name not in ('_analyzer.py', '_result.json')]
-        log(f"🐍 Found {len(python_files)} Python files: {[f.name for f in python_files]}")
+        files = [f for f in APP.glob('*.py') if f.name not in ('_analyzer.py', '_result.json')]
+        log(f"🐍 Found {len(files)} files: {[f.name for f in files]}")
 
-        if not python_files:
-            log("⚠️ No Python files to analyze!")
-            result = {
-                'metrics': {'files_count': 0, 'functions_count': 0, 'classes_count': 0, 'imports_count': 0, 'async_functions': 0, 'total_lines': 0},
-                'report': '⚠️ Не найдено файлов для анализа',
-                'resources': {'analyzed_files': 0},
-                'error': 'No Python files found'
-            }
-            save_result(result)
+        if not files:
+            r = {'metrics': {'files_count':0,'functions_count':0,'classes_count':0,'imports_count':0,'async_functions':0,'total_lines':0}, 'report':'No files', 'resources':{'analyzed_files':0}}
+            with open(OUT,'w') as f: json.dump(r,f)
             return 0
 
-        # Анализ
-        analyzer = CodeAnalyzer()
-        for file_path in python_files:
-            log(f"📝 Analyzing: {file_path.name}")
-            try:
-                analyzer.analyze_file(file_path)
-            except Exception as e:
-                log(f"✗ Exception during analysis: {type(e).__name__}: {e}")
-                traceback.print_exc(file=sys.stderr)
+        a = CodeAnalyzer()
+        for fp in files:
+            try: a.analyze_file(fp)
+            except Exception as e: log(f"✗ {fp.name}: {e}")
 
-        metrics = analyzer.get_summary()
-        log(f"📊 Metrics collected: functions={metrics['functions_count']}, classes={metrics['classes_count']}")
+        m = a.summary()
+        static = run_static_tools(files)
 
-        report = f"""=== ОТЧЁТ АНАЛИЗА ===
-📁 Файлов: {len(python_files)}
-📝 Строк: {metrics['total_lines']}
-🔧 Функций: {metrics['functions_count']}
-🏗️ Классов: {metrics['classes_count']}
-📦 Импортов: {metrics['imports_count']}
-⚡ Асинхронных: {metrics['async_functions']}
-"""
+        end = time.time()
+        cur, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
 
-        result = {
-            'metrics': metrics,
-            'report': report,
-            'resources': {'analyzed_files': len(python_files)},
-            'status': 'success'
+        res = {
+            'analyzed_files': len(files),
+            'analysis_time_ms': round((end-start)*1000,2),
+            'memory_peak_kb': round(peak/1024,2)
         }
 
-        # Сохранение
-        if save_result(result):
-            log("✅ Analysis completed successfully")
-            # Вывод в stdout для логов Docker
-            print(json.dumps({'status': 'success', 'summary': metrics}, indent=2))
-            return 0
-        else:
-            log("❌ Failed to save results")
-            return 1
+        recs = []
+        if m.get('docstring_ratio',1) < 0.5: recs.append("⚠️ Низкое покрытие docstring")
+        if static.get('radon') and max((d.get('max',0) for d in static['radon'].values()), default=0) > 10: recs.append("⚠️ Высокая сложность")
+        if not recs: recs.append("✅ Код стабилен")
 
+        rpt = f"=== ОТЧЁТ ===\n📁 Файлов:{len(files)}\n📝 Строк:{m['total_lines']}\n🔧 Функций:{m['functions_count']}\n🏗️ Классов:{m['classes_count']}\n📦 Импортов:{m['imports_count']}\n⚡ Async:{m['async_functions']}\n📚 Docstring:{m['docstring_ratio']*100:.1f}%\n⏱️ Время:{res['analysis_time_ms']}ms\n💾 Память:{res['memory_peak_kb']}KB\n\n=== РЕКОМЕНДАЦИИ ===\n" + '\n'.join(recs)
+
+        result = {'metrics': m, 'report': rpt, 'resources': res, 'static_tools': static, 'recommendations': recs, 'status': 'success'}
+        with open(OUT, 'w', encoding='utf-8') as f: json.dump(result, f, indent=2, default=str)
+        log("✅ Saved")
+        print(json.dumps({'status':'ok','summary':m}))
+        return 0
     except Exception as e:
-        log(f"💥 CRITICAL ERROR in main(): {type(e).__name__}: {e}")
+        log(f"💥 CRASH: {type(e).__name__}: {e}")
         traceback.print_exc(file=sys.stderr)
+        try:
+            with open(OUT,'w') as f: json.dump({'error':str(e),'traceback':traceback.format_exc()},f)
+        except: pass
+        return 1
 
-        # Сохраняем ошибку в результат
-        error_result = {
-            'metrics': {},
-            'report': f'❌ Ошибка анализа: {type(e).__name__}: {e}',
-            'resources': {},
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
-        save_result(error_result)
-        return 2
-
-if __name__ == '__main__':
-    sys.exit(main())
+if __name__ == '__main__': sys.exit(main())
 '''

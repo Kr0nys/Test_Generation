@@ -90,6 +90,7 @@ class AnalysisSessionViewSet(viewsets.ModelViewSet):
             'status': 'pending'
         }, status=status.HTTP_202_ACCEPTED)
 
+
 class TestGenerationTaskViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = TestGenerationTask.objects.all()
     serializer_class = TestGenerationTaskSerializer
