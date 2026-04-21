@@ -1,5 +1,3 @@
-# backend/analyzer/utils/ai_generator.py
-
 import requests
 import json
 import logging

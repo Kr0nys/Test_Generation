@@ -158,6 +158,11 @@ def generate_tests_task(self, task_id: str):
 
         logger.info(f"✅ Test generation completed: {len(tests)} characters")
 
+        if not tests or not tests.strip():
+            logger.error("⚠️ WARNING: Generated tests are EMPTY!")
+            logger.error(f"Config used: {task.config}")
+            logger.error(f"Code snippet sent to AI: {code_content[:500]}...")
+
         return {
             'status': 'success',
             'task_id': task_id,

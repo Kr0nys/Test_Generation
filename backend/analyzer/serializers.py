@@ -17,6 +17,8 @@ class AnalysisSessionSerializer(serializers.ModelSerializer):
     """Сериализатор для просмотра сессии"""
 
     files_count = serializers.SerializerMethodField()
+    generated_tests = serializers.SerializerMethodField()
+    latest_test_task = serializers.SerializerMethodField()
 
     class Meta:
         model = AnalysisSession
@@ -24,7 +26,9 @@ class AnalysisSessionSerializer(serializers.ModelSerializer):
             'id', 'user', 'name', 'python_version', 'dependencies',
             'status', 'uploaded_files', 'metrics', 'report_text',
             'error_message', 'created_at', 'updated_at', 'expires_at',
-            'files_count'
+            'files_count',
+            'generated_tests',
+            'latest_test_task',
         ]
         read_only_fields = [
             'id', 'user', 'created_at', 'updated_at', 'expires_at'
@@ -33,6 +37,25 @@ class AnalysisSessionSerializer(serializers.ModelSerializer):
     def get_files_count(self, obj):
         return obj.files.count()
 
+    def get_generated_tests(self, obj):
+        """Возвращает код тестов из последней завершённой задачи"""
+        task = obj.testgenerationtask_set.filter(
+            status='COMPLETED'
+        ).order_by('-created_at').first()
+        return task.generated_tests if task else None
+
+    def get_latest_test_task(self, obj):
+        """Возвращает полную информацию о последней задаче генерации"""
+        task = obj.testgenerationtask_set.order_by('-created_at').first()
+        if task:
+            return {
+                'id': str(task.id),
+                'status': task.status,
+                'config': task.config,
+                'created_at': task.created_at,
+                'error_message': task.error_message
+            }
+        return None
 
 class UploadedFileSerializer(serializers.ModelSerializer):
     """Сериализатор для загруженных файлов"""
