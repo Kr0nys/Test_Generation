@@ -107,9 +107,10 @@ def analyze_project(self, session_id: str):
 
 @shared_task(bind=True, max_retries=2)
 def generate_tests_task(self, task_id: str):
-    """
-    Задача генерации юнит-тестов с помощью локальной AI модели (Ollama).
-    """
+    """Задача генерации юнит-тестов с помощью AI"""
+    from .models import TestGenerationTask, AnalysisSession
+    from .utils.ai_generator import AITestGenerator
+
     try:
         task = TestGenerationTask.objects.get(id=task_id)
         logger.info(f"🧪 Starting test generation for task {task_id}")
@@ -118,9 +119,18 @@ def generate_tests_task(self, task_id: str):
         task.save(update_fields=['status', 'updated_at'])
 
         session = task.session
-        generator = AITestGenerator()
+        generator = AITestGenerator(model=task.config.get('model', 'llama3.2'))
 
-        # Собираем код из всех файлов сессии
+        if not generator.check_ollama_available():
+            logger.warning("⚠️ Ollama service not available")
+            task.config['fallback'] = True
+        elif not generator.check_model_available(task.config.get('model', 'llama3.2')):
+            logger.warning(f"⚠️ Model '{task.config.get('model')}' not found in Ollama")
+            task.config['fallback'] = True
+            task.error_message = f"Model '{task.config.get('model')}' not pulled. Run: ollama pull {task.config.get('model')}"
+            task.save(update_fields=['config', 'error_message'])
+
+        # Собираем код из файлов
         code_content = ""
         for uploaded_file in session.files.all():
             try:
@@ -133,25 +143,36 @@ def generate_tests_task(self, task_id: str):
         if not code_content.strip():
             raise ValueError("No code content available for test generation")
 
-        # Ограничиваем длину кода для AI (чтобы не превысить контекст модели)
-        code_content = code_content[:15000]
-
+        # Генерация тестов
         logger.info(f"🤖 Generating tests with config: {task.config}")
         tests = generator.generate_tests(
-            code=code_content,
+            code=code_content[:15000],  # Ограничиваем для AI
             metrics=session.metrics,
             config=task.config
         )
 
-        task.generated_tests = tests
-        task.status = 'COMPLETED'
-        task.save(update_fields=['generated_tests', 'status', 'updated_at'])
+        cleaned_tests = (tests or "").replace('\ufeff', '').replace('\u200b', '').replace('\u200c', '').strip()
+        if len(cleaned_tests) < 50 and 'AI' in task.config.get('detail_level', ''):
+            logger.warning(f"⚠️ Generated tests suspiciously short ({len(cleaned_tests)} chars), marking as FAILED")
+            task.generated_tests = cleaned_tests
+            task.status = 'FAILED'
+            task.error_message = f"Generated tests too short ({len(cleaned_tests)} chars), likely AI error"
+        else:
+            task.generated_tests = cleaned_tests
+            task.status = 'COMPLETED'
 
-        # Обновляем статус сессии
+        task.save(update_fields=['generated_tests', 'status', 'error_message', 'updated_at'])
+
+        # Обновляем сессию
         session.status = 'TESTS_GENERATED'
         session.save(update_fields=['status', 'updated_at'])
 
-        logger.info(f"✅ Test generation completed: {len(tests)} characters generated")
+        logger.info(f"✅ Test generation completed: {len(tests)} characters")
+
+        if not tests or not tests.strip():
+            logger.error("⚠️ WARNING: Generated tests are EMPTY!")
+            logger.error(f"Config used: {task.config}")
+            logger.error(f"Code snippet sent to AI: {code_content[:500]}...")
 
         return {
             'status': 'success',
@@ -171,11 +192,10 @@ def generate_tests_task(self, task_id: str):
             task.status = 'FAILED'
             task.error_message = str(exc)
             task.save(update_fields=['status', 'error_message', 'updated_at'])
-        except Exception as e:
-            logger.error(f"Could not update task status: {e}")
+        except:
+            pass
 
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
-
 
 @shared_task
 def cleanup_expired_sessions():
