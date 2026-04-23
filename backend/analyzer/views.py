@@ -4,21 +4,11 @@ from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from .models import AnalysisSession, TestGenerationTask, UploadedFile
 from .serializers import (
-    AnalysisSessionSerializer,
-    AnalysisSessionCreateSerializer,
-    UploadedFileSerializer,
-    TestGenerationTaskSerializer,
-    TestGenerationConfigSerializer
+    AnalysisSessionSerializer, AnalysisSessionCreateSerializer,
+    TestGenerationTaskSerializer, TestGenerationConfigSerializer
 )
 from .tasks import analyze_project, generate_tests_task
-from django.http import HttpResponse
 
-import ast
-import tempfile
-import subprocess
-import logging
-
-logger = logging.getLogger(__name__)
 
 class AnalysisSessionViewSet(viewsets.ModelViewSet):
     queryset = AnalysisSession.objects.all()
@@ -70,109 +60,35 @@ class AnalysisSessionViewSet(viewsets.ModelViewSet):
             'task_id': str(session.id)
         }, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=['post'], url_path='generate_tests')
+    @action(
+        detail=True,
+        methods=['post'],
+        url_path='generate_tests',
+        parser_classes=[JSONParser]
+    )
     def generate_tests(self, request, pk=None):
-        """Запуск генерации тестов с помощью AI"""
         session = self.get_object()
 
-        # Проверка статуса
-        if session.status not in ['ANALYZED', 'TESTS_GENERATED']:
+        if session.status != 'ANALYZED':
             return Response(
-                {'error': f'Session status is {session.status}. Must be ANALYZED first.'},
+                {'error': 'Session must be analyzed first'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Валидация конфигурации
         serializer = TestGenerationConfigSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        # Создаём задачу
         task = TestGenerationTask.objects.create(
             session=session,
             config=serializer.validated_data
         )
 
-        # Запускаем асинхронно
         generate_tests_task.delay(str(task.id))
 
         return Response({
             'task_id': str(task.id),
-            'status': 'pending',
-            'message': 'Test generation started'
+            'status': 'pending'
         }, status=status.HTTP_202_ACCEPTED)
-
-    @action(detail=True, methods=['get'], url_path='tests')
-    def get_tests(self, request, pk=None):
-        """Получить сгенерированные тесты"""
-        session = self.get_object()
-
-        task = session.testgenerationtask_set.filter(
-            status='COMPLETED'
-        ).order_by('-created_at').first()
-
-        if not task:
-            return Response({
-                'tests': None,
-                'status': 'not_generated',
-                'message': 'Tests not generated yet'
-            })
-
-        return Response({
-            'tests': task.generated_tests,
-            'status': task.status,
-            'config': task.config,
-            'created_at': task.created_at
-        })
-
-    @action(detail=True, methods=['post'], url_path='tests/validate')
-    def validate_tests(self, request, pk=None):
-        """Валидация синтаксиса тестов"""
-        session = self.get_object()
-
-        task = session.testgenerationtask_set.filter(
-            status='COMPLETED'
-        ).order_by('-created_at').first()
-
-        if not task or not task.generated_tests:
-            return Response(
-                {'error': 'No tests to validate'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        try:
-            ast.parse(task.generated_tests)
-            return Response({
-                'valid': True,
-                'message': 'Tests are syntactically valid'
-            })
-        except SyntaxError as e:
-            return Response({
-                'valid': False,
-                'message': f'Syntax error: {e}',
-                'line': e.lineno
-            })
-
-    @action(detail=True, methods=['get'], url_path='tests/download')
-    def download_tests(self, request, pk=None):
-        """Скачать тесты как файл"""
-        session = self.get_object()
-
-        task = session.testgenerationtask_set.filter(
-            status='COMPLETED'
-        ).order_by('-created_at').first()
-
-        if not task or not task.generated_tests:
-            return Response(
-                {'error': 'No tests to download'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        response = HttpResponse(
-            task.generated_tests,
-            content_type='text/x-python'
-        )
-        response['Content-Disposition'] = f'attachment; filename="tests_{session.id}.py"'
-        return response
 
 
 class TestGenerationTaskViewSet(viewsets.ReadOnlyModelViewSet):

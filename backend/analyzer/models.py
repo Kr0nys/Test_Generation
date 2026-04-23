@@ -2,7 +2,6 @@ from django.db import models
 from django.contrib.auth.models import User
 from django.utils import timezone
 from datetime import timedelta
-from rest_framework import serializers
 import uuid
 
 
@@ -37,84 +36,31 @@ class AnalysisSession(models.Model):
             self.expires_at = timezone.now() + timedelta(days=7)
         super().save(*args, **kwargs)
 
-class UploadedFile(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    session = models.ForeignKey(AnalysisSession, on_delete=models.CASCADE, related_name='files')
-
-    file = models.FileField(upload_to='uploads/%Y/%m/%d/')
-    original_name = models.CharField(max_length=255)
-    file_size = models.BigIntegerField()
-
-    uploaded_at = models.DateTimeField(auto_now_add=True)
 
 class TestGenerationTask(models.Model):
-    """Задача генерации тестов"""
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('GENERATING', 'Generating'),
+        ('COMPLETED', 'Completed'),
+        ('FAILED', 'Failed'),
+    ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    session = models.ForeignKey(AnalysisSession, on_delete=models.CASCADE, related_name='testgenerationtask_set')
-
-    # Конфигурация генерации
+    session = models.ForeignKey(AnalysisSession, on_delete=models.CASCADE, related_name='test_tasks')
     config = models.JSONField(default=dict)
-
-    # Результаты
-    generated_tests = models.TextField(blank=True)
-
-    # Статусы задачи
-    STATUS_CHOICES = [
-        ('PENDING', 'Ожидает'),
-        ('GENERATING', 'Генерируется'),
-        ('COMPLETED', 'Завершено'),
-        ('FAILED', 'Ошибка'),
-    ]
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
-    error_message = models.TextField(blank=True)
-
+    generated_tests = models.TextField(blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    error_message = models.TextField(blank=True, default='')
 
     class Meta:
         ordering = ['-created_at']
 
-    def __str__(self):
-        return f"TestTask {self.id} - {self.status}"
 
-
-class TestGenerationConfigSerializer(serializers.Serializer):
-    """Конфигурация генерации тестов"""
-
-    detail_level = serializers.ChoiceField(
-        choices=['basic', 'advanced', 'full'],
-        default='advanced',
-        help_text='Уровень детализации тестов'
-    )
-    use_mocks = serializers.BooleanField(
-        default=True,
-        help_text='Использовать моки для внешних зависимостей'
-    )
-    include_edge_cases = serializers.BooleanField(
-        default=True,
-        help_text='Включить тесты граничных случаев'
-    )
-    test_framework = serializers.ChoiceField(
-        choices=['pytest', 'unittest'],
-        default='pytest',
-        help_text='Фреймворк для тестов'
-    )
-    model = serializers.CharField(
-        default='llama3.2',
-        help_text='AI модель для генерации'
-    )
-
-
-class TestGenerationTaskSerializer(serializers.ModelSerializer):
-    """Сериализатор задачи генерации тестов"""
-
-    config = serializers.JSONField()
-
-    class Meta:
-        model = TestGenerationTask
-        fields = [
-            'id', 'session', 'config', 'generated_tests',
-            'status', 'error_message', 'created_at', 'updated_at'
-        ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+class UploadedFile(models.Model):
+    session = models.ForeignKey(AnalysisSession, on_delete=models.CASCADE, related_name='files')
+    file = models.FileField(upload_to='uploads/%Y/%m/%d/')
+    original_name = models.CharField(max_length=255)
+    file_size = models.IntegerField(default=0)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
